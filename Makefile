@@ -63,8 +63,29 @@ test-all: unit-test integration-test
 	@echo ""
 	@echo "=== All 58 tests passed ==="
 
+# === Benchmark: Disk Read vs Processing ===
+benchmark: logproc genlog
+	@echo "=== Generating 500M test logs ==="
+	@./output/genlog 500M bench_logs.txt
+	@FILE_SIZE=$$(ls -l bench_logs.txt | awk '{print $$5}'); \
+	FILE_MB=$$(echo "scale=2; $$FILE_SIZE / 1048576" | bc); \
+	echo "File size: $$FILE_MB MB"; \
+	echo ""; \
+	echo "=== Raw Disk Read (dd bs=1M) ==="; \
+	TIME_START=$$(python3 -c "import time; print(time.time())"); \
+	dd if=bench_logs.txt of=/dev/null bs=1M 2>/dev/null; \
+	TIME_END=$$(python3 -c "import time; print(time.time())"); \
+	DISK_TIME=$$(echo "scale=4; $$TIME_END - $$TIME_START" | bc); \
+	DISK_SPEED=$$(echo "scale=0; $$FILE_MB / $$DISK_TIME" | bc); \
+	echo "Time: $${DISK_TIME}s"; \
+	echo "Speed: $${DISK_SPEED} MB/s"; \
+	echo ""; \
+	echo "=== logproc Processing (8 threads) ==="; \
+	./output/logproc --count-only -t 8 bench_logs.txt 2>&1 | grep -E "(Time:|Speed:)"
+	@rm -f bench_logs.txt
+
 clean:
 	rm -f ./output/*.o ./output/logproc ./output/genlog
 	rm -f test_logs.txt
 
-.PHONY: all clean test unit-test integration-test test-all
+.PHONY: all clean test unit-test integration-test test-all benchmark

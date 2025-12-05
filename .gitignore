@@ -29,3 +29,5 @@ zig-out/
 *.swp
 *.swo
 *~
+
+*.txt
