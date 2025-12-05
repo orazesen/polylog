@@ -15,12 +15,14 @@ extern "C"
         int valid;
         int filtered; // 1=should output, 0=filtered out
         int msg_len;
+        long long timestamp; // Unix timestamp
         char msg[256];
     };
 
     // Output format: 0=JSON, 1=CSV, 2=TSV, 3=RAW
     static int output_format = 0;
     static int header_written = 0;
+    static int output_fd = 1; // Default: stdout
 
     // Buffered output for efficiency (thread-safe)
     static char write_buffer[65536];
@@ -33,11 +35,17 @@ extern "C"
         output_format = format;
     }
 
+    // Set output file descriptor from C
+    void set_output_fd(int fd)
+    {
+        output_fd = fd;
+    }
+
     static void do_flush()
     {
         if (buffer_pos > 0)
         {
-            write(1, write_buffer, buffer_pos);
+            write(output_fd, write_buffer, buffer_pos);
             buffer_pos = 0;
         }
     }
@@ -72,7 +80,28 @@ extern "C"
     {
         buffer_write("{\"level\":\"", 10);
         buffer_str(level);
-        buffer_write("\",\"message\":\"", 13);
+        buffer_write("\",\"timestamp\":", 14);
+        char ts_buf[24];
+        int ts_len = 0;
+        long long ts = entry->timestamp;
+        if (ts == 0)
+        {
+            ts_buf[ts_len++] = '0';
+        }
+        else
+        {
+            char tmp[24];
+            int tmp_len = 0;
+            while (ts > 0)
+            {
+                tmp[tmp_len++] = '0' + (ts % 10);
+                ts /= 10;
+            }
+            while (tmp_len > 0)
+                ts_buf[ts_len++] = tmp[--tmp_len];
+        }
+        buffer_write(ts_buf, ts_len);
+        buffer_write(",\"message\":\"", 13);
         for (int i = 0; i < entry->msg_len; i++)
         {
             char c = entry->msg[i];
@@ -87,11 +116,34 @@ extern "C"
     {
         if (!header_written)
         {
-            buffer_str("level,message\n");
+            buffer_str("level,timestamp,message\n");
             header_written = 1;
         }
         buffer_str(level);
+        buffer_char(',');
+        // Write timestamp
+        char ts_buf[24];
+        int ts_len = 0;
+        long long ts = entry->timestamp;
+        if (ts == 0)
+        {
+            ts_buf[ts_len++] = '0';
+        }
+        else
+        {
+            char tmp[24];
+            int tmp_len = 0;
+            while (ts > 0)
+            {
+                tmp[tmp_len++] = '0' + (ts % 10);
+                ts /= 10;
+            }
+            while (tmp_len > 0)
+                ts_buf[ts_len++] = tmp[--tmp_len];
+        }
+        buffer_write(ts_buf, ts_len);
         buffer_str(",\"");
+        ;
         for (int i = 0; i < entry->msg_len; i++)
         {
             char c = entry->msg[i];
@@ -106,10 +158,32 @@ extern "C"
     {
         if (!header_written)
         {
-            buffer_str("level\tmessage\n");
+            buffer_str("level\ttimestamp\tmessage\n");
             header_written = 1;
         }
         buffer_str(level);
+        buffer_char('\t');
+        // Write timestamp
+        char ts_buf[24];
+        int ts_len = 0;
+        long long ts = entry->timestamp;
+        if (ts == 0)
+        {
+            ts_buf[ts_len++] = '0';
+        }
+        else
+        {
+            char tmp[24];
+            int tmp_len = 0;
+            while (ts > 0)
+            {
+                tmp[tmp_len++] = '0' + (ts % 10);
+                ts /= 10;
+            }
+            while (tmp_len > 0)
+                ts_buf[ts_len++] = tmp[--tmp_len];
+        }
+        buffer_write(ts_buf, ts_len);
         buffer_char('\t');
         buffer_write(entry->msg, entry->msg_len);
         buffer_char('\n');

@@ -59,6 +59,61 @@ static const char* INVALID_MSGS[] = {
 #define NUM_INVALID 4
 #define WRITE_BUFFER_SIZE (4 * 1024 * 1024)  // 4MB buffer for max throughput
 
+// Date range for log generation (unix timestamps)
+static int64_t start_timestamp = 0;
+static int64_t end_timestamp = 0;
+static int64_t timestamp_range = 0;
+
+// Parse date string to unix timestamp (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)
+static int64_t parse_datetime(const char* str) {
+    int year = 0, month = 1, day = 1, hour = 0, min = 0, sec = 0;
+    // Parse YYYY-MM-DD
+    if (strlen(str) >= 10) {
+        year = (str[0]-'0')*1000 + (str[1]-'0')*100 + (str[2]-'0')*10 + (str[3]-'0');
+        month = (str[5]-'0')*10 + (str[6]-'0');
+        day = (str[8]-'0')*10 + (str[9]-'0');
+    }
+    // Parse optional HH:MM:SS
+    if (strlen(str) >= 19) {
+        hour = (str[11]-'0')*10 + (str[12]-'0');
+        min = (str[14]-'0')*10 + (str[15]-'0');
+        sec = (str[17]-'0')*10 + (str[18]-'0');
+    }
+    // Convert to timestamp (simplified, assumes UTC)
+    int y = year, m = month;
+    if (m <= 2) { y -= 1; m += 12; }
+    int64_t era = y / 400;
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (m - 3) + 2) / 5 + day - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    int64_t days = era * 146097 + doe - 719468;
+    return days * 86400 + hour * 3600 + min * 60 + sec;
+}
+
+// Convert timestamp to date components
+static void timestamp_to_date(int64_t ts, int* year, int* month, int* day, 
+                              int* hour, int* min, int* sec) {
+    int64_t days = ts / 86400;
+    int64_t secs = ts % 86400;
+    if (secs < 0) { secs += 86400; days--; }
+    
+    *hour = (int)(secs / 3600);
+    *min = (int)((secs % 3600) / 60);
+    *sec = (int)(secs % 60);
+    
+    // Civil from days (algorithm from Howard Hinnant)
+    days += 719468;
+    int64_t era = (days >= 0 ? days : days - 146096) / 146097;
+    int64_t doe = days - era * 146097;
+    int64_t yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+    int64_t y = yoe + era * 400;
+    int64_t doy = doe - (365*yoe + yoe/4 - yoe/100);
+    int64_t mp = (5*doy + 2) / 153;
+    *day = (int)(doy - (153*mp + 2)/5 + 1);
+    *month = (int)(mp + (mp < 10 ? 3 : -9));
+    *year = (int)(y + (*month <= 2 ? 1 : 0));
+}
+
 // Fast integer to string (much faster than sprintf for numbers)
 static inline int fast_itoa2(char* buf, int val) {
     buf[0] = '0' + (val / 10);
@@ -85,13 +140,20 @@ static inline int generate_valid_entry(char* buf, struct LogEntry* entry) {
     const char* msg = MESSAGES[msg_idx];
     entry->msg_len = strlen(msg);
     
-    // Build output: "YYYY-MM-DD HH:MM:SS LEVEL message\n"
-    int year = 2024 + fast_rand(2);
-    int month = 1 + fast_rand(12);
-    int day = 1 + fast_rand(28);
-    int hour = fast_rand(24);
-    int min = fast_rand(60);
-    int sec = fast_rand(60);
+    // Generate timestamp within range
+    int year, month, day, hour, min, sec;
+    if (timestamp_range > 0) {
+        int64_t ts = start_timestamp + (int64_t)(xorshift64() % (uint64_t)timestamp_range);
+        timestamp_to_date(ts, &year, &month, &day, &hour, &min, &sec);
+    } else {
+        // Default: random dates in 2024-2025
+        year = 2024 + fast_rand(2);
+        month = 1 + fast_rand(12);
+        day = 1 + fast_rand(28);
+        hour = fast_rand(24);
+        min = fast_rand(60);
+        sec = fast_rand(60);
+    }
     
     // Date
     p += fast_itoa4(p, year); *p++ = '-';
@@ -138,12 +200,15 @@ static inline int generate_invalid_entry(char* buf, struct LogEntry* entry) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <count> [output_file]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <count> [output_file] [--start DATE] [--end DATE]\n", argv[0]);
         fprintf(stderr, "  count       - Number of log entries (supports K, M, B suffixes)\n");
         fprintf(stderr, "  output_file - Output file (default: stdout)\n");
+        fprintf(stderr, "  --start     - Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)\n");
+        fprintf(stderr, "  --end       - End date\n");
         fprintf(stderr, "\nExamples:\n");
-        fprintf(stderr, "  %s 1M > logs.txt      # 1 million entries\n", argv[0]);
-        fprintf(stderr, "  %s 1B logs.txt        # 1 billion entries\n", argv[0]);
+        fprintf(stderr, "  %s 1M > logs.txt                              # 1 million entries\n", argv[0]);
+        fprintf(stderr, "  %s 1M logs.txt --start 2024-01-01 --end 2024-01-31  # January 2024\n", argv[0]);
+        fprintf(stderr, "  %s 1B logs.txt                                # 1 billion entries\n", argv[0]);
         return 1;
     }
 
@@ -154,10 +219,27 @@ int main(int argc, char** argv) {
     else if (*endptr == 'M' || *endptr == 'm') count *= 1000000ULL;
     else if (*endptr == 'B' || *endptr == 'b') count *= 1000000000ULL;
 
+    // Parse remaining arguments
+    const char* output_file = NULL;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--start") == 0 && i + 1 < argc) {
+            start_timestamp = parse_datetime(argv[++i]);
+        } else if (strcmp(argv[i], "--end") == 0 && i + 1 < argc) {
+            end_timestamp = parse_datetime(argv[++i]);
+        } else if (argv[i][0] != '-') {
+            output_file = argv[i];
+        }
+    }
+    
+    // Calculate timestamp range
+    if (start_timestamp > 0 && end_timestamp > start_timestamp) {
+        timestamp_range = end_timestamp - start_timestamp;
+    }
+
     // Open output
     FILE* out = stdout;
-    if (argc >= 3) {
-        out = fopen(argv[2], "w");
+    if (output_file) {
+        out = fopen(output_file, "w");
         if (!out) {
             perror("Failed to open output file");
             return 1;

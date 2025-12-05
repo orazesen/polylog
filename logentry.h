@@ -9,6 +9,7 @@ struct LogEntry {
     int valid;          // 1=valid log entry, 0=invalid
     int filtered;       // 1=should output, 0=filtered out (set by processor)
     int msg_len;        // Length of extracted message
+    long long timestamp; // Unix timestamp (seconds since epoch)
     char msg[256];      // Extracted message content
 };
 
