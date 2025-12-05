@@ -48,8 +48,23 @@ test: logproc genlog
 	./output/logproc --count-only -t 4 test_logs.txt
 	@rm -f test_logs.txt
 
+# === Unit Tests (Zig) ===
+unit-test:
+	@echo "=== Running Zig unit tests (36 tests) ==="
+	$(ZIG) test test_logproc.zig
+
+# === Integration Tests (Zig) ===
+integration-test: logproc genlog
+	@echo "=== Running Zig integration tests (22 tests) ==="
+	$(ZIG) test test_integration.zig
+
+# === All Tests ===
+test-all: unit-test integration-test
+	@echo ""
+	@echo "=== All 58 tests passed ==="
+
 clean:
 	rm -f ./output/*.o ./output/logproc ./output/genlog
 	rm -f test_logs.txt
 
-.PHONY: all clean test
+.PHONY: all clean test unit-test integration-test test-all

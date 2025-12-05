@@ -1,0 +1,31 @@
+# Build outputs
+output/*.o
+output/logproc
+output/genlog
+
+# Test files
+test_logs.txt
+_test*.txt
+_zig_*.txt
+_empty.txt
+_single.txt
+_stdout.txt
+_out.txt
+
+# Split-by-level outputs
+debug.txt
+info.txt
+warn.txt
+error.txt
+
+# Zig cache
+.zig-cache/
+zig-out/
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
