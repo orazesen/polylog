@@ -88,4 +88,20 @@ clean:
 	rm -f ./output/*.o ./output/logproc ./output/genlog
 	rm -f test_logs.txt
 
-.PHONY: all clean test unit-test integration-test test-all benchmark
+# === Generate Assembly Code ===
+assembly: ./output/reader.s ./output/parser.s ./output/processor.s ./output/formatter.s
+	@echo "=== Assembly files generated in ./output/ ==="
+
+./output/reader.s: reader.c logentry.h
+	$(CC) -S $(CFLAGS) reader.c -o ./output/reader.s
+
+./output/parser.s: parser.zig
+	$(ZIG) build-obj $(ZIGFLAGS) parser.zig -femit-asm=./output/parser.s
+
+./output/processor.s: processor.rs
+	$(RUSTC) --crate-type=staticlib --emit=asm $(RUSTFLAGS) processor.rs -o ./output/processor.s 2>/dev/null
+
+./output/formatter.s: formatter.cpp
+	$(CXX) -S $(CXXFLAGS) formatter.cpp -o ./output/formatter.s
+
+.PHONY: all clean test unit-test integration-test test-all benchmark assembly
