@@ -1,14 +1,15 @@
 // Fast Log Generator - C version for billions of entries
-// Uses LogEntry struct for consistency with log processor
 // Compile: clang -O3 -o genlog generate_logs.c
-// Usage: ./genlog <count> [output_file]
+// Usage: ./genlog <count> [output_file] [--start DATE --end DATE]
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <string.h>
+#include <errno.h>
+#include <signal.h>
 #include <time.h>
-#include "logentry.h"
 
 // Fast PRNG (xorshift64) - much faster than rand()
 static uint64_t rng_state;
@@ -58,36 +59,76 @@ static const char* INVALID_MSGS[] = {
 #define NUM_MESSAGES 15
 #define NUM_INVALID 4
 #define WRITE_BUFFER_SIZE (4 * 1024 * 1024)  // 4MB buffer for max throughput
+#define MAX_COUNT (UINT64_MAX / 100)         // Keeps the progress math (i * 100) from overflowing
 
 // Date range for log generation (unix timestamps)
 static int64_t start_timestamp = 0;
 static int64_t end_timestamp = 0;
 static int64_t timestamp_range = 0;
 
-// Parse date string to unix timestamp (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)
-static int64_t parse_datetime(const char* str) {
-    int year = 0, month = 1, day = 1, hour = 0, min = 0, sec = 0;
-    // Parse YYYY-MM-DD
-    if (strlen(str) >= 10) {
-        year = (str[0]-'0')*1000 + (str[1]-'0')*100 + (str[2]-'0')*10 + (str[3]-'0');
-        month = (str[5]-'0')*10 + (str[6]-'0');
-        day = (str[8]-'0')*10 + (str[9]-'0');
+// Parse date string to unix timestamp (exactly YYYY-MM-DD or YYYY-MM-DD HH:MM:SS, UTC)
+// Returns 0 on success, -1 if the string is malformed or not a real calendar date
+static int parse_datetime(const char* str, int64_t* out) {
+    static const char pattern[] = "dddd-dd-dd dd:dd:dd";
+    static const int month_days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    size_t n = strlen(str);
+    if (n != 10 && n != 19) return -1;
+    for (size_t i = 0; i < n; i++) {
+        if (pattern[i] == 'd') {
+            if (str[i] < '0' || str[i] > '9') return -1;
+        } else if (str[i] != pattern[i]) {
+            return -1;
+        }
     }
-    // Parse optional HH:MM:SS
-    if (strlen(str) >= 19) {
+
+    int year = (str[0]-'0')*1000 + (str[1]-'0')*100 + (str[2]-'0')*10 + (str[3]-'0');
+    int month = (str[5]-'0')*10 + (str[6]-'0');
+    int day = (str[8]-'0')*10 + (str[9]-'0');
+    int hour = 0, min = 0, sec = 0;
+    if (n == 19) {
         hour = (str[11]-'0')*10 + (str[12]-'0');
         min = (str[14]-'0')*10 + (str[15]-'0');
         sec = (str[17]-'0')*10 + (str[18]-'0');
     }
-    // Convert to timestamp (simplified, assumes UTC)
+
+    if (month < 1 || month > 12) return -1;
+    int leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    int days_in_month = month_days[month - 1] + (month == 2 && leap);
+    if (day < 1 || day > days_in_month) return -1;
+    if (hour > 23 || min > 59 || sec > 59) return -1;
+
+    // Days from civil (algorithm from Howard Hinnant)
     int y = year, m = month;
     if (m <= 2) { y -= 1; m += 12; }
-    int64_t era = y / 400;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
     int64_t yoe = y - era * 400;
     int64_t doy = (153 * (m - 3) + 2) / 5 + day - 1;
     int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     int64_t days = era * 146097 + doe - 719468;
-    return days * 86400 + hour * 3600 + min * 60 + sec;
+    *out = days * 86400 + hour * 3600 + min * 60 + sec;
+    return 0;
+}
+
+// Parse "<digits>[K|M|B]" into an entry count
+// Returns 0 on success, -1 on anything else (sign, garbage, unknown suffix, overflow)
+static int parse_count(const char* str, uint64_t* out) {
+    // strtoull would accept leading whitespace and a sign, so insist on a digit
+    if (str[0] < '0' || str[0] > '9') return -1;
+    char* endptr;
+    errno = 0;
+    unsigned long long value = strtoull(str, &endptr, 10);
+    if (errno == ERANGE) return -1;
+
+    uint64_t scale = 1;
+    if (*endptr == 'K' || *endptr == 'k') scale = 1000ULL;
+    else if (*endptr == 'M' || *endptr == 'm') scale = 1000000ULL;
+    else if (*endptr == 'B' || *endptr == 'b') scale = 1000000000ULL;
+    if (scale != 1) endptr++;
+    if (*endptr != '\0') return -1;
+
+    if (value > MAX_COUNT / scale) return -1;
+    *out = (uint64_t)value * scale;
+    return 0;
 }
 
 // Convert timestamp to date components
@@ -130,15 +171,11 @@ static inline int fast_itoa4(char* buf, int val) {
 }
 
 // Generate a valid log line directly into buffer (no sprintf overhead)
-static inline int generate_valid_entry(char* buf, struct LogEntry* entry) {
+static inline int generate_valid_entry(char* buf) {
     char* p = buf;
     
-    // Populate LogEntry
-    entry->level = fast_rand(4);  // LOG_DEBUG to LOG_ERROR
-    entry->valid = 1;
-    int msg_idx = fast_rand(NUM_MESSAGES);
-    const char* msg = MESSAGES[msg_idx];
-    entry->msg_len = strlen(msg);
+    const char* level = LEVEL_NAMES[fast_rand(4)];
+    const char* msg = MESSAGES[fast_rand(NUM_MESSAGES)];
     
     // Generate timestamp within range
     int year, month, day, hour, min, sec;
@@ -166,30 +203,18 @@ static inline int generate_valid_entry(char* buf, struct LogEntry* entry) {
     p += fast_itoa2(p, sec); *p++ = ' ';
     
     // Level
-    const char* level = LEVEL_NAMES[entry->level];
     while (*level) *p++ = *level++;
     *p++ = ' ';
     
-    // Message (also copy to entry)
-    const char* m = msg;
-    char* dst = entry->msg;
-    while (*m) {
-        *p++ = *m;
-        *dst++ = *m++;
-    }
-    *dst = '\0';
+    // Message
+    while (*msg) *p++ = *msg++;
     *p++ = '\n';
     
     return (int)(p - buf);
 }
 
 // Generate invalid entry
-static inline int generate_invalid_entry(char* buf, struct LogEntry* entry) {
-    entry->valid = 0;
-    entry->level = 0;
-    entry->msg_len = 0;
-    entry->msg[0] = '\0';
-    
+static inline int generate_invalid_entry(char* buf) {
     const char* invalid = INVALID_MSGS[fast_rand(NUM_INVALID)];
     char* p = buf;
     while (*invalid) *p++ = *invalid++;
@@ -198,58 +223,106 @@ static inline int generate_invalid_entry(char* buf, struct LogEntry* entry) {
     return (int)(p - buf);
 }
 
+static void print_usage(const char* prog) {
+    fprintf(stderr, "Usage: %s <count> [output_file] [--start DATE --end DATE]\n", prog);
+    fprintf(stderr, "  count       - Number of log entries (supports K, M, B suffixes)\n");
+    fprintf(stderr, "  output_file - Output file (default: stdout)\n");
+    fprintf(stderr, "  --start     - Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS), needs --end\n");
+    fprintf(stderr, "  --end       - End date (exclusive, must be later than --start)\n");
+    fprintf(stderr, "  -h, --help  - Show this help\n");
+    fprintf(stderr, "\nExamples:\n");
+    fprintf(stderr, "  %s 1M > logs.txt                              # 1 million entries\n", prog);
+    fprintf(stderr, "  %s 1M logs.txt --start 2024-01-01 --end 2024-02-01  # January 2024\n", prog);
+    fprintf(stderr, "  %s 1B logs.txt                                # 1 billion entries\n", prog);
+}
+
 int main(int argc, char** argv) {
+    const char* prog = argc > 0 ? argv[0] : "genlog";
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <count> [output_file] [--start DATE] [--end DATE]\n", argv[0]);
-        fprintf(stderr, "  count       - Number of log entries (supports K, M, B suffixes)\n");
-        fprintf(stderr, "  output_file - Output file (default: stdout)\n");
-        fprintf(stderr, "  --start     - Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)\n");
-        fprintf(stderr, "  --end       - End date\n");
-        fprintf(stderr, "\nExamples:\n");
-        fprintf(stderr, "  %s 1M > logs.txt                              # 1 million entries\n", argv[0]);
-        fprintf(stderr, "  %s 1M logs.txt --start 2024-01-01 --end 2024-01-31  # January 2024\n", argv[0]);
-        fprintf(stderr, "  %s 1B logs.txt                                # 1 billion entries\n", argv[0]);
+        print_usage(prog);
         return 1;
+    }
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_usage(prog);
+            return 0;
+        }
     }
 
     // Parse count with K/M/B suffix
-    char* endptr;
-    uint64_t count = strtoull(argv[1], &endptr, 10);
-    if (*endptr == 'K' || *endptr == 'k') count *= 1000ULL;
-    else if (*endptr == 'M' || *endptr == 'm') count *= 1000000ULL;
-    else if (*endptr == 'B' || *endptr == 'b') count *= 1000000000ULL;
+    uint64_t count;
+    if (parse_count(argv[1], &count) != 0) {
+        fprintf(stderr, "Error: invalid count '%s' (expected digits with an optional K, M or B suffix)\n", argv[1]);
+        return 1;
+    }
 
     // Parse remaining arguments
     const char* output_file = NULL;
+    int has_start = 0, has_end = 0;
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--start") == 0 && i + 1 < argc) {
-            start_timestamp = parse_datetime(argv[++i]);
-        } else if (strcmp(argv[i], "--end") == 0 && i + 1 < argc) {
-            end_timestamp = parse_datetime(argv[++i]);
-        } else if (argv[i][0] != '-') {
+        if (strcmp(argv[i], "--start") == 0 || strcmp(argv[i], "--end") == 0) {
+            const char* opt = argv[i];
+            int is_start = (opt[2] == 's');
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: option %s requires a value\n", opt);
+                return 1;
+            }
+            if (parse_datetime(argv[++i], is_start ? &start_timestamp : &end_timestamp) != 0) {
+                fprintf(stderr, "Error: invalid date '%s' for %s (expected YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)\n",
+                        argv[i], opt);
+                return 1;
+            }
+            if (is_start) has_start = 1; else has_end = 1;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "Error: unknown option '%s'\n", argv[i]);
+            return 1;
+        } else if (output_file) {
+            fprintf(stderr, "Error: unexpected argument '%s' (output file is already '%s')\n",
+                    argv[i], output_file);
+            return 1;
+        } else {
             output_file = argv[i];
         }
     }
     
     // Calculate timestamp range
-    if (start_timestamp > 0 && end_timestamp > start_timestamp) {
+    if (has_start != has_end) {
+        fprintf(stderr, "Error: --start and --end must be given together\n");
+        return 1;
+    }
+    if (has_start) {
+        if (end_timestamp <= start_timestamp) {
+            fprintf(stderr, "Error: --end must be later than --start\n");
+            return 1;
+        }
         timestamp_range = end_timestamp - start_timestamp;
     }
+
+    // Allocate buffers
+    char* write_buffer = malloc(WRITE_BUFFER_SIZE);
+    if (!write_buffer) {
+        fprintf(stderr, "Error: out of memory\n");
+        return 1;
+    }
+    char line_buffer[512];
 
     // Open output
     FILE* out = stdout;
     if (output_file) {
         out = fopen(output_file, "w");
         if (!out) {
-            perror("Failed to open output file");
+            fprintf(stderr, "Error: cannot open output file '%s': %s\n", output_file, strerror(errno));
+            free(write_buffer);
             return 1;
         }
     }
-
-    // Allocate buffers
-    char* write_buffer = malloc(WRITE_BUFFER_SIZE);
-    char* line_buffer = malloc(512);
     setvbuf(out, write_buffer, _IOFBF, WRITE_BUFFER_SIZE);
+
+#ifdef SIGXFSZ
+    // Hitting a file size limit should surface as a write error, not kill the process.
+    // SIGPIPE keeps its default: a reader that goes away ends the run quietly.
+    signal(SIGXFSZ, SIG_IGN);
+#endif
 
     // Seed RNG with high-resolution time
     struct timespec ts;
@@ -257,12 +330,13 @@ int main(int argc, char** argv) {
     rng_state = (uint64_t)ts.tv_sec ^ (uint64_t)ts.tv_nsec ^ 0xDEADBEEFCAFEULL;
     if (rng_state == 0) rng_state = 1;
 
-    struct LogEntry entry;
     uint64_t valid_count = 0, invalid_count = 0;
     uint64_t progress_interval = count / 100;
     if (progress_interval == 0) progress_interval = 1;
+    int progress_shown = 0;
+    int write_errno = 0;
 
-    fprintf(stderr, "Generating %llu log entries (using LogEntry struct)...\n", count);
+    fprintf(stderr, "Generating %" PRIu64 " log entries...\n", count);
     
     struct timespec start_ts;
     clock_gettime(CLOCK_MONOTONIC, &start_ts);
@@ -270,20 +344,38 @@ int main(int argc, char** argv) {
     for (uint64_t i = 0; i < count; i++) {
         // Progress every 1%
         if (i % progress_interval == 0 && i > 0) {
-            fprintf(stderr, "\r%llu%% (%llu/%llu)", (i * 100) / count, i, count);
+            fprintf(stderr, "\r%" PRIu64 "%% (%" PRIu64 "/%" PRIu64 ")", (i * 100) / count, i, count);
+            progress_shown = 1;
         }
 
         int len;
         // 90% valid, 10% invalid
         if (fast_rand(10) < 9) {
-            len = generate_valid_entry(line_buffer, &entry);
+            len = generate_valid_entry(line_buffer);
             valid_count++;
         } else {
-            len = generate_invalid_entry(line_buffer, &entry);
+            len = generate_invalid_entry(line_buffer);
             invalid_count++;
         }
         
-        fwrite(line_buffer, 1, len, out);
+        // Stop at the first failed write (full disk, closed pipe with SIGPIPE
+        // ignored) instead of spinning through the remaining entries
+        if (fwrite(line_buffer, 1, (size_t)len, out) != (size_t)len) {
+            write_errno = errno ? errno : EIO;
+            break;
+        }
+    }
+
+    // The stream keeps using write_buffer until it is closed (stdout included),
+    // so close first and free afterwards. fclose also reports a failed final flush.
+    if (fclose(out) != 0 && !write_errno) write_errno = errno ? errno : EIO;
+    free(write_buffer);
+
+    if (write_errno) {
+        if (progress_shown) fputc('\n', stderr);
+        fprintf(stderr, "Error: write to %s failed: %s\n",
+                output_file ? output_file : "stdout", strerror(write_errno));
+        return 1;
     }
 
     struct timespec end_ts;
@@ -293,13 +385,10 @@ int main(int argc, char** argv) {
     if (elapsed < 0.001) elapsed = 0.001;
 
     fprintf(stderr, "\r100%% Complete!                    \n");
-    fprintf(stderr, "Generated: %llu entries (%llu valid, %llu invalid)\n", 
+    fprintf(stderr, "Generated: %" PRIu64 " entries (%" PRIu64 " valid, %" PRIu64 " invalid)\n",
             count, valid_count, invalid_count);
     fprintf(stderr, "Time: %.2f seconds (~%.0f entries/sec)\n", 
-            elapsed, count / elapsed);
+            elapsed, (double)count / elapsed);
 
-    if (out != stdout) fclose(out);
-    free(write_buffer);
-    free(line_buffer);
     return 0;
 }
