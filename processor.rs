@@ -11,10 +11,15 @@ pub struct LogEntry {
     pub msg: [u8; 256],
 }
 
+// Layout must match struct LogEntry in logentry.h (compile-time only, no runtime code)
+const _: () = assert!(core::mem::size_of::<LogEntry>() == 280);
+
 // Global filter config (set by C reader)
+// Written only before the worker threads start and read-only afterwards, so the
+// unsynchronized reads are sound; accessed by value or raw pointer, never by reference.
 static mut LEVEL_MASK: i32 = 0b1111; // All levels
 static mut LEVEL_FILTER_ACTIVE: i32 = 0;
-static mut TIME_AFTER: i64 = 0; // 0 = no filter
+static mut TIME_AFTER: i64 = i64::MIN; // MIN = no filter (dates before 1970 are negative)
 static mut TIME_BEFORE: i64 = i64::MAX; // MAX = no filter
 static mut TIME_FILTER_ACTIVE: i32 = 0;
 static mut MSG_PATTERN: [u8; 256] = [0; 256];
@@ -37,34 +42,41 @@ pub unsafe extern "C" fn set_time_filter(after: i64, before: i64, active: i32) {
 }
 
 // Initialize message filter from C (substring match, case-insensitive)
+// An empty pattern (also a null pointer or a negative length) means no message filter
 #[no_mangle]
 pub unsafe extern "C" fn set_message_filter(pattern: *const u8, len: i32) {
-    MSG_PATTERN_LEN = len as usize;
-    if MSG_PATTERN_LEN > 255 {
-        MSG_PATTERN_LEN = 255;
+    if pattern.is_null() || len <= 0 {
+        MSG_PATTERN_LEN = 0;
+        MSG_FILTER_ACTIVE = 0;
+        return;
     }
-    for i in 0..MSG_PATTERN_LEN {
+    let pat_len = if len > 255 { 255 } else { len as usize };
+    let dst = &raw mut MSG_PATTERN as *mut u8;
+    for i in 0..pat_len {
         // Convert to lowercase for case-insensitive match
         let c = *pattern.add(i);
-        MSG_PATTERN[i] = if c >= b'A' && c <= b'Z' { c + 32 } else { c };
+        *dst.add(i) = if c >= b'A' && c <= b'Z' { c + 32 } else { c };
     }
+    MSG_PATTERN_LEN = pat_len;
     MSG_FILTER_ACTIVE = 1;
 }
 
 // Case-insensitive substring search (no bounds checks to avoid panic symbols)
 unsafe fn contains_pattern(msg: *const u8, msg_len: usize) -> bool {
-    if MSG_PATTERN_LEN == 0 || MSG_PATTERN_LEN > msg_len {
+    let pat = &raw const MSG_PATTERN as *const u8;
+    let pat_len = MSG_PATTERN_LEN;
+    if pat_len > msg_len {
         return false;
     }
-    let end = msg_len - MSG_PATTERN_LEN + 1;
+    let end = msg_len - pat_len + 1;
     let mut i = 0usize;
     while i < end {
         let mut matched = true;
         let mut j = 0usize;
-        while j < MSG_PATTERN_LEN {
+        while j < pat_len {
             let c = *msg.add(i + j);
             let c_lower = if c >= b'A' && c <= b'Z' { c + 32 } else { c };
-            if c_lower != *MSG_PATTERN.as_ptr().add(j) {
+            if c_lower != *pat.add(j) {
                 matched = false;
                 break;
             }
@@ -91,8 +103,8 @@ pub unsafe extern "C" fn process_log(entry: *mut LogEntry) {
 
     // Apply level filter
     if LEVEL_FILTER_ACTIVE != 0 {
-        let level_bit = 1 << e.level;
-        if (LEVEL_MASK & level_bit) == 0 {
+        // A level outside 0..=3 has no mask bit and must never become a shift amount
+        if e.level < 0 || e.level > 3 || (LEVEL_MASK & (1 << e.level)) == 0 {
             e.filtered = 0;
             return;
         }
@@ -108,7 +120,9 @@ pub unsafe extern "C" fn process_log(entry: *mut LogEntry) {
 
     // Apply message filter (case-insensitive substring)
     if MSG_FILTER_ACTIVE != 0 {
-        if !contains_pattern(e.msg.as_ptr(), e.msg_len as usize) {
+        // msg_len comes from the caller: keep the search inside msg
+        let msg_len = (e.msg_len.max(0) as usize).min(e.msg.len());
+        if !contains_pattern(e.msg.as_ptr(), msg_len) {
             e.filtered = 0;
             return;
         }

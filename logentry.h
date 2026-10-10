@@ -13,10 +13,12 @@ struct LogEntry {
     char msg[256];      // Extracted message content
 };
 
-// Filter configuration (set by reader, used by processor)
-struct FilterConfig {
-    int level_mask;     // Bitmask: bit0=DEBUG, bit1=INFO, bit2=WARN, bit3=ERROR
-    int filter_active;  // 1=filtering enabled, 0=pass all
-};
+// parser.zig and processor.rs declare this layout by hand; fail the build if
+// the C/C++ side ever stops matching it
+#ifdef __cplusplus
+static_assert(sizeof(struct LogEntry) == 280, "LogEntry must be 280 bytes");
+#else
+_Static_assert(sizeof(struct LogEntry) == 280, "LogEntry must be 280 bytes");
+#endif
 
 #endif
